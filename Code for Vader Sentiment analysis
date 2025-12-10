@@ -1,0 +1,119 @@
+import os
+import re
+import pandas as pd
+import spacy
+from vaderSentiment.vaderSentiment import SentimentIntensityAnalyzer
+
+# --------- 1. SETTINGS ---------
+
+# Path to your corpus file (update extension if needed)
+file_path = "/Users/user/Desktop/Other Docs/Multiple Sclerosis/Data/r_MultipleSclerosis_corpus.txt"
+
+# Full list of Emotion Systems Model categories
+EMOTION_WORDS = [
+    "anger", "frustration", "guilt", "joy", "hope", "love", "pride", "relief",
+    "dislike", "distress", "fear", "regret", "sadness", "contempt", "disgust", "shame"
+]
+
+# Output CSV path
+output_path = "/Users/user/Desktop/Other Docs/Multiple Sclerosis/Data/r_MS_vader_sentences_all_emotions.csv"
+
+# --------- 2. LOAD LIGHTWEIGHT SPACY PIPELINE ---------
+
+print("Initialising lightweight spaCy pipeline (sentencizer only)...")
+
+# Use a blank English pipeline to save memory
+nlp = spacy.blank("en")
+
+# Add rule-based sentence segmentation
+nlp.add_pipe("sentencizer")
+
+# Increase max_length to allow processing of your large corpus
+nlp.max_length = 2_500_000  # increase if you later use a bigger corpus
+
+# Create VADER analyzer
+analyzer = SentimentIntensityAnalyzer()
+
+# --------- 3. LOAD RAW TEXT ---------
+
+if not os.path.exists(file_path):
+    raise FileNotFoundError(f"File not found: {file_path}")
+
+print(f"Reading corpus from: {file_path}")
+with open(file_path, "r", encoding="utf-8", errors="ignore") as f:
+    raw_text = f.read()
+
+print(f"Length of raw text: {len(raw_text)} characters")
+
+# --------- 4. SENTENCE SEGMENTATION ---------
+
+print("Segmenting text into sentences with spaCy sentencizer...")
+doc = nlp(raw_text)
+
+sentences = [sent.text.strip() for sent in doc.sents if sent.text.strip()]
+
+print(f"Number of sentences extracted: {len(sentences)}")
+
+# --------- 5. FIND EMOTIONS IN EACH SENTENCE ---------
+
+def find_emotions_in_sentence(sentence: str, emotion_words):
+    """
+    Return a list of emotion words that appear in the sentence
+    as whole words (case-insensitive).
+    """
+    found = []
+    for emo in emotion_words:
+        pattern = rf"\b{re.escape(emo)}\b"
+        if re.search(pattern, sentence, flags=re.IGNORECASE):
+            found.append(emo)
+    return found
+
+rows = []
+print("Scanning sentences for emotion words and running VADER...")
+
+def label_sentiment(compound_score: float) -> str:
+    """
+    Convert VADER compound score into a simple label.
+    """
+    if compound_score >= 0.05:
+        return "positive"
+    elif compound_score <= -0.05:
+        return "negative"
+    else:
+        return "neutral"
+
+for sent in sentences:
+    emotions_in_sent = find_emotions_in_sentence(sent, EMOTION_WORDS)
+    if not emotions_in_sent:
+        # Skip sentences that do not contain any of the target emotion words
+        continue
+
+    scores = analyzer.polarity_scores(sent)
+    compound = scores["compound"]
+    label = label_sentiment(compound)
+
+    rows.append({
+        "sentence": sent,
+        "emotions": ", ".join(sorted(set(emotions_in_sent))),  # e.g. "fear, regret"
+        "compound": compound,
+        "neg": scores["neg"],
+        "neu": scores["neu"],
+        "pos": scores["pos"],
+        "sentiment_label": label,
+    })
+
+df = pd.DataFrame(rows)
+
+print(f"Number of sentences containing at least one target emotion: {len(df)}")
+print("Sample of results:")
+print(df.head())
+
+# --------- 6. SAVE TO CSV ---------
+
+# Make sure the output directory exists
+os.makedirs(os.path.dirname(output_path), exist_ok=True)
+
+df.to_csv(output_path, index=False)
+
+print(f"Results saved to: {output_path}")
+print("Done.")

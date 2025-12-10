@@ -1,0 +1,92 @@
+from pathlib import Path
+import spacy
+
+# ======================
+#  PATHS
+# ======================
+
+DATA_DIR = Path("/Users/user/Desktop/Other Docs/Multiple Sclerosis/Data")
+CLEAN_DIR = DATA_DIR / "cleaned"
+COMBINED_FILE = CLEAN_DIR / "combined_ms_cleaned.txt"
+
+# Create output directory if it does not exist
+CLEAN_DIR.mkdir(exist_ok=True)
+
+# ======================
+#  LOAD SPACY MODEL
+# ======================
+
+# Make sure you've installed this first:
+#   python -m spacy download en_core_web_sm
+nlp = spacy.load("en_core_web_sm")
+
+# Increase max length in case some files are large
+nlp.max_length = 2_000_000  # adjust higher if needed
+
+
+def preprocess_text(text: str) -> str:
+    """
+    Preprocess text with spaCy:
+      - tokenize & lemmatise
+      - lowercase
+      - remove punctuation, numbers, urls/emails, and non-alphabetic tokens
+    Returns a string of space-separated tokens.
+    """
+    doc = nlp(text)
+    clean_tokens = []
+
+    for token in doc:
+        # Skip spaces, punctuation, URLs, emails, pure digits
+        if token.is_space or token.is_punct or token.like_url or token.like_email:
+            continue
+        if token.is_digit:
+            continue
+
+        # Use lemma, lowercased
+        lemma = token.lemma_.lower()
+
+        # Keep only alphabetic tokens (no mixed alphanumerics)
+        if not lemma.isalpha():
+            continue
+
+        clean_tokens.append(lemma)
+
+    return " ".join(clean_tokens)
+
+
+def main():
+    if not DATA_DIR.exists():
+        print(f"Data directory not found: {DATA_DIR}")
+        return
+
+    txt_files = sorted(DATA_DIR.glob("*.txt"))
+    if not txt_files:
+        print(f"No .txt files found in {DATA_DIR}")
+        return
+
+    print(f"Found {len(txt_files)} text files in {DATA_DIR}")
+    all_cleaned_lines = []
+
+    for txt_file in txt_files:
+        print(f"Processing: {txt_file.name}")
+        text = txt_file.read_text(encoding="utf-8", errors="ignore")
+
+        cleaned = preprocess_text(text)
+
+        # Save per-file cleaned version
+        out_file = CLEAN_DIR / f"{txt_file.stem}_cleaned.txt"
+        out_file.write_text(cleaned + "\n", encoding="utf-8")
+
+        all_cleaned_lines.append(cleaned)
+
+    # Save combined corpus
+    print(f"Writing combined file to: {COMBINED_FILE}")
+    COMBINED_FILE.write_text("\n".join(all_cleaned_lines), encoding="utf-8")
+
+    print("\n✅ Preprocessing complete.")
+    print(f"Cleaned files are in: {CLEAN_DIR}")
+    print(f"Combined cleaned corpus: {COMBINED_FILE}")
+
+
+if __name__ == "__main__":
+    main()

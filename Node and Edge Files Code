@@ -1,0 +1,101 @@
+from pathlib import Path
+from collections import Counter, defaultdict
+import csv
+
+# =============================
+# PATH TO CLEANED CORPUS FILES
+# =============================
+CLEANED_DIR = Path("/Users/user/Desktop/Other Docs/Multiple Sclerosis/Data/cleaned")
+NODE_FILE = CLEANED_DIR / "nodes.csv"
+EDGE_FILE = CLEANED_DIR / "edges.csv"
+
+# Window size for co-occurrence (±4 words)
+WINDOW_SIZE = 4
+
+
+def read_tokens_from_cleaned_files(cleaned_dir: Path):
+    """Reads all cleaned .txt files and returns a list of tokens."""
+    all_tokens = []
+
+    txt_files = sorted(cleaned_dir.glob("*.txt"))
+    if not txt_files:
+        print("No cleaned .txt files found.")
+        return []
+
+    for file in txt_files:
+        print(f"Reading: {file.name}")
+        text = file.read_text(encoding="utf-8", errors="ignore").strip()
+        tokens = text.split()
+        all_tokens.extend(tokens)
+
+    print(f"Total tokens loaded: {len(all_tokens)}")
+    return all_tokens
+
+
+def extract_unigrams(tokens):
+    """Returns unigram frequency counter."""
+    return Counter(tokens)
+
+
+def extract_cooccurrences(tokens, window=4):
+    """
+    Computes co-occurrence counts for all token pairs within a ±window.
+    Returns a dictionary {(word1, word2): weight}
+    """
+    cooccurrence = defaultdict(int)
+
+    for i, token in enumerate(tokens):
+        start = max(0, i - window)
+        end = min(len(tokens), i + window + 1)
+
+        for j in range(start, end):
+            if i != j:
+                pair = tuple(sorted([token, tokens[j]]))  # undirected pair
+                cooccurrence[pair] += 1
+
+    print(f"Total unique edges: {len(cooccurrence)}")
+    return cooccurrence
+
+
+def save_nodes(unigrams, output_file):
+    """Save node frequencies to CSV."""
+    print(f"Saving nodes → {output_file}")
+
+    with output_file.open("w", encoding="utf-8", newline="") as f:
+        writer = csv.writer(f)
+        writer.writerow(["id", "label", "frequency"])
+
+        for word, freq in unigrams.items():
+            writer.writerow([word, word, freq])
+
+
+def save_edges(cooccurrence, output_file):
+    """Save edges to CSV."""
+    print(f"Saving edges → {output_file}")
+
+    with output_file.open("w", encoding="utf-8", newline="") as f:
+        writer = csv.writer(f)
+        writer.writerow(["source", "target", "weight"])
+
+        for (w1, w2), weight in cooccurrence.items():
+            writer.writerow([w1, w2, weight])
+
+
+def main():
+    tokens = read_tokens_from_cleaned_files(CLEANED_DIR)
+    if not tokens:
+        return
+
+    unigrams = extract_unigrams(tokens)
+    cooccurrence = extract_cooccurrences(tokens, window=WINDOW_SIZE)
+
+    save_nodes(unigrams, NODE_FILE)
+    save_edges(cooccurrence, EDGE_FILE)
+
+    print("\n✅ Node and edge extraction complete.")
+    print(f"Nodes file saved at: {NODE_FILE}")
+    print(f"Edges file saved at: {EDGE_FILE}")
+
+
+if __name__ == "__main__":
+    main()

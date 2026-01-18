@@ -1,119 +1,197 @@
-import os
-import re
+#!/usr/bin/env python3
+"""
+VADER sentiment analysis for a corpus using a local VADER lexicon file.
+
+You said your VADER lexicon is here:
+- /Users/user/Downloads/vader_lexicon   (may be .txt)
+
+This script:
+- loads the lexicon from that path (no internet needed)
+- reads your corpus file
+- computes VADER compound/pos/neu/neg scores
+- outputs:
+  - per-line (per-document) scores if your corpus is one doc per line
+  - corpus summary (mean + median + std)
+
+Default corpus path (edit or pass via --corpus):
+- /Users/user/Desktop/Other Docs/Multiple Sclerosis/Data/preprocessed/r_MultipleSclerosis_corpus.preprocessed.txt
+"""
+
+from __future__ import annotations
+
+import argparse
+from pathlib import Path
+import statistics as stats
+from typing import Dict, Iterable, List
+
 import pandas as pd
-import spacy
 from vaderSentiment.vaderSentiment import SentimentIntensityAnalyzer
 
-# --------- 1. SETTINGS ---------
 
-# Path to your corpus file (update extension if needed)
-file_path = "/Users/user/Desktop/Other Docs/Multiple Sclerosis/Data/r_MultipleSclerosis_corpus.txt"
+def resolve_lexicon(path: Path) -> Path:
+    """Handle cases where user gives basename without extension."""
+    if path.exists():
+        return path
+    if path.with_suffix(".txt").exists():
+        return path.with_suffix(".txt")
+    raise FileNotFoundError(f"VADER lexicon not found at: {path} (or {path}.txt)")
 
-# Full list of Emotion Systems Model categories
-EMOTION_WORDS = [
-    "anger", "frustration", "guilt", "joy", "hope", "love", "pride", "relief",
-    "dislike", "distress", "fear", "regret", "sadness", "contempt", "disgust", "shame"
-]
 
-# Output CSV path
-output_path = "/Users/user/Desktop/Other Docs/Multiple Sclerosis/Data/r_MS_vader_sentences_all_emotions.csv"
-
-# --------- 2. LOAD LIGHTWEIGHT SPACY PIPELINE ---------
-
-print("Initialising lightweight spaCy pipeline (sentencizer only)...")
-
-# Use a blank English pipeline to save memory
-nlp = spacy.blank("en")
-
-# Add rule-based sentence segmentation
-nlp.add_pipe("sentencizer")
-
-# Increase max_length to allow processing of your large corpus
-nlp.max_length = 2_500_000  # increase if you later use a bigger corpus
-
-# Create VADER analyzer
-analyzer = SentimentIntensityAnalyzer()
-
-# --------- 3. LOAD RAW TEXT ---------
-
-if not os.path.exists(file_path):
-    raise FileNotFoundError(f"File not found: {file_path}")
-
-print(f"Reading corpus from: {file_path}")
-with open(file_path, "r", encoding="utf-8", errors="ignore") as f:
-    raw_text = f.read()
-
-print(f"Length of raw text: {len(raw_text)} characters")
-
-# --------- 4. SENTENCE SEGMENTATION ---------
-
-print("Segmenting text into sentences with spaCy sentencizer...")
-doc = nlp(raw_text)
-
-sentences = [sent.text.strip() for sent in doc.sents if sent.text.strip()]
-
-print(f"Number of sentences extracted: {len(sentences)}")
-
-# --------- 5. FIND EMOTIONS IN EACH SENTENCE ---------
-
-def find_emotions_in_sentence(sentence: str, emotion_words):
+def build_analyzer_from_local_lexicon(lexicon_path: Path) -> SentimentIntensityAnalyzer:
     """
-    Return a list of emotion words that appear in the sentence
-    as whole words (case-insensitive).
-    """
-    found = []
-    for emo in emotion_words:
-        pattern = rf"\b{re.escape(emo)}\b"
-        if re.search(pattern, sentence, flags=re.IGNORECASE):
-            found.append(emo)
-    return found
+    Build a VADER analyzer and replace its lexicon with entries from the local file.
 
-rows = []
-print("Scanning sentences for emotion words and running VADER...")
+    Expected VADER lexicon format per line:
+      token<TAB>score [optional extra columns]
 
-def label_sentiment(compound_score: float) -> str:
+    Comment lines begin with '#'.
     """
-    Convert VADER compound score into a simple label.
+    analyzer = SentimentIntensityAnalyzer()
+
+    lex: Dict[str, float] = {}
+    with lexicon_path.open("r", encoding="utf-8", errors="ignore") as f:
+        for line in f:
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            parts = line.split("\t")
+            if len(parts) < 2:
+                continue
+            token = parts[0].strip()
+            try:
+                score = float(parts[1])
+            except ValueError:
+                continue
+            if token:
+                lex[token] = score
+
+    if not lex:
+        raise ValueError(
+            "Loaded 0 lexicon entries. Check that your file is the standard VADER lexicon format "
+            "(token<TAB>score per line)."
+        )
+
+    analyzer.lexicon = lex
+    return analyzer
+
+
+def read_docs(corpus_path: Path, one_doc_per_line: bool) -> Iterable[str]:
     """
-    if compound_score >= 0.05:
-        return "positive"
-    elif compound_score <= -0.05:
-        return "negative"
+    Read corpus:
+    - if one_doc_per_line: each line is a doc
+    - else: whole file is one doc
+    """
+    if one_doc_per_line:
+        with corpus_path.open("r", encoding="utf-8", errors="ignore") as f:
+            for line in f:
+                line = line.strip()
+                if line:
+                    yield line
     else:
-        return "neutral"
+        text = corpus_path.read_text(encoding="utf-8", errors="ignore").strip()
+        if text:
+            yield text
 
-for sent in sentences:
-    emotions_in_sent = find_emotions_in_sentence(sent, EMOTION_WORDS)
-    if not emotions_in_sent:
-        # Skip sentences that do not contain any of the target emotion words
-        continue
 
-    scores = analyzer.polarity_scores(sent)
-    compound = scores["compound"]
-    label = label_sentiment(compound)
+def summarize(values: List[float]) -> dict:
+    if not values:
+        return {"mean": 0.0, "median": 0.0, "std": 0.0, "min": 0.0, "max": 0.0}
+    return {
+        "mean": float(stats.mean(values)),
+        "median": float(stats.median(values)),
+        "std": float(stats.pstdev(values)) if len(values) > 1 else 0.0,
+        "min": float(min(values)),
+        "max": float(max(values)),
+    }
 
-    rows.append({
-        "sentence": sent,
-        "emotions": ", ".join(sorted(set(emotions_in_sent))),  # e.g. "fear, regret"
-        "compound": compound,
-        "neg": scores["neg"],
-        "neu": scores["neu"],
-        "pos": scores["pos"],
-        "sentiment_label": label,
-    })
 
-df = pd.DataFrame(rows)
+def main() -> int:
+    ap = argparse.ArgumentParser(description="Run VADER sentiment analysis using a local VADER lexicon file.")
+    ap.add_argument(
+        "--corpus",
+        default="/Users/user/Desktop/Other Docs/Multiple Sclerosis/Data/preprocessed/r_MultipleSclerosis_corpus.preprocessed.txt",
+        help="Path to the corpus text file.",
+    )
+    ap.add_argument(
+        "--lexicon",
+        default="/Users/user/Downloads/vader_lexicon",
+        help="Path to the local VADER lexicon (basename ok; .txt will be tried).",
+    )
+    ap.add_argument(
+        "--out-dir",
+        default="/Users/user/Desktop/Other Docs/Multiple Sclerosis/Data/vader_results",
+        help="Output directory for CSV files.",
+    )
+    ap.add_argument(
+        "--whole-file-one-doc",
+        action="store_true",
+        help="Treat the entire corpus file as one document (default is one doc per line).",
+    )
+    args = ap.parse_args()
 
-print(f"Number of sentences containing at least one target emotion: {len(df)}")
-print("Sample of results:")
-print(df.head())
+    corpus_path = Path(args.corpus).expanduser()
+    lexicon_path = resolve_lexicon(Path(args.lexicon).expanduser())
+    out_dir = Path(args.out_dir).expanduser()
+    out_dir.mkdir(parents=True, exist_ok=True)
 
-# --------- 6. SAVE TO CSV ---------
+    if not corpus_path.exists():
+        print(f"ERROR: Corpus file not found:\n  {corpus_path}")
+        return 1
+    if not lexicon_path.exists():
+        print(f"ERROR: Lexicon file not found:\n  {lexicon_path}")
+        return 1
 
-# Make sure the output directory exists
-os.makedirs(os.path.dirname(output_path), exist_ok=True)
+    try:
+        analyzer = build_analyzer_from_local_lexicon(lexicon_path)
+    except Exception as e:
+        print("ERROR: Failed to load local VADER lexicon.")
+        print(str(e))
+        return 1
 
-df.to_csv(output_path, index=False)
+    rows = []
+    compounds = []
+    poss = []
+    neus = []
+    negs = []
 
-print(f"Results saved to: {output_path}")
-print("Done.")
+    for doc_id, text in enumerate(read_docs(corpus_path, one_doc_per_line=not args.whole_file_one_doc), start=1):
+        scores = analyzer.polarity_scores(text)
+        rows.append({
+            "doc_id": doc_id,
+            "compound": scores["compound"],
+            "pos": scores["pos"],
+            "neu": scores["neu"],
+            "neg": scores["neg"],
+        })
+        compounds.append(scores["compound"])
+        poss.append(scores["pos"])
+        neus.append(scores["neu"])
+        negs.append(scores["neg"])
+
+    doc_df = pd.DataFrame(rows)
+
+    summary = {
+        "n_docs": int(doc_df["doc_id"].nunique()) if not doc_df.empty else 0,
+        **{f"compound_{k}": v for k, v in summarize(compounds).items()},
+        **{f"pos_{k}": v for k, v in summarize(poss).items()},
+        **{f"neu_{k}": v for k, v in summarize(neus).items()},
+        **{f"neg_{k}": v for k, v in summarize(negs).items()},
+    }
+    summary_df = pd.DataFrame([summary])
+
+    doc_out = out_dir / "vader_doc_scores.csv"
+    summary_out = out_dir / "vader_corpus_summary.csv"
+    doc_df.to_csv(doc_out, index=False)
+    summary_df.to_csv(summary_out, index=False)
+
+    print("Done ✅")
+    print(f"Corpus:   {corpus_path}")
+    print(f"Lexicon:  {lexicon_path}")
+    print(f"Docs:     {len(doc_df)}")
+    print(f"Outputs:  {doc_out}")
+    print(f"          {summary_out}")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

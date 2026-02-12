@@ -1,0 +1,166 @@
+options(repos = c(CRAN = "https://cloud.r-project.org"))
+
+# ---- Packages ----
+pkgs <- c("RedditExtractoR", "httr", "jsonlite", "dplyr", "stringr", "openxlsx")
+for (p in pkgs) {
+  if (!requireNamespace(p, quietly = TRUE)) install.packages(p, dependencies = TRUE)
+}
+library(RedditExtractoR)
+library(httr)
+library(jsonlite)
+library(dplyr)
+library(stringr)
+library(openxlsx)
+
+SUB <- "MultipleSclerosis"
+KEYWORDS <- c("side effect", "adverse effect", "infusion reaction",
+              "intolerance", "complication", "symptom")
+
+# Regex for matching content (handles plurals/variants)
+pattern <- regex(
+  "(side\\s*effects?|adverse\\s*effects?|infusion\\s*reactions?|intoleran(ce|t)|complications?|symptoms?)",
+  ignore_case = TRUE
+)
+
+# ---- Helper: build OR query for Reddit search ----
+build_or_query <- function(terms) {
+  terms <- trimws(terms)
+  terms <- ifelse(grepl("\\s", terms), paste0('"', terms, '"'), terms)
+  paste0("(", paste(terms, collapse = " OR "), ")")
+}
+query <- build_or_query(KEYWORDS)
+
+# ---- 1) Get thread URLs (keyword retrieval only) ----
+ms_urls <- RedditExtractoR::find_thread_urls(
+  keywords  = query,
+  subreddit = SUB,
+  sort_by   = "new",
+  period    = "all"
+) %>%
+  filter(!is.na(url), url != "") %>%
+  distinct(url, .keep_all = TRUE)
+
+cat("✅ Thread URLs found:", nrow(ms_urls), "\n")
+if (nrow(ms_urls) == 0) stop("No threads found for these keywords.")
+
+# OPTIONAL: test on a small set first (uncomment)
+# ms_urls <- ms_urls %>% slice_head(n = 20)
+
+`%||%` <- function(a, b) if (!is.null(a)) a else b
+
+# ---- Helper: fetch thread JSON safely ----
+fetch_thread_json <- function(thread_url, tries = 3, pause = 2) {
+  json_url <- paste0(thread_url, ".json")
+  for (i in 1:tries) {
+    resp <- tryCatch(
+      GET(json_url, add_headers(`User-Agent` = "Mozilla/5.0 (R; MS keyword corpus)")),
+      error = function(e) NULL
+    )
+    if (!is.null(resp) && status_code(resp) == 200) {
+      txt <- content(resp, as = "text", encoding = "UTF-8")
+      return(fromJSON(txt, simplifyVector = FALSE))
+    }
+    Sys.sleep(pause)
+  }
+  return(NULL)
+}
+
+# ---- Helper: flatten nested Reddit comments ----
+flatten_comments <- function(children, acc = list()) {
+  if (length(children) == 0) return(acc)
+
+  for (ch in children) {
+    if (!is.null(ch$kind) && ch$kind == "t1") {
+      d <- ch$data
+      body <- d$body %||% ""
+
+      # Keep ONLY keyword-matching comments
+      if (str_detect(body, pattern)) {
+        acc[[length(acc) + 1]] <- data.frame(
+          created_utc = d$created_utc %||% NA,
+          author      = d$author %||% NA,
+          score       = d$score %||% NA,
+          comment_id  = d$id %||% NA,
+          parent_id   = d$parent_id %||% NA,
+          link_id     = d$link_id %||% NA,
+          body        = body,
+          permalink   = paste0("https://www.reddit.com", d$permalink %||% ""),
+          stringsAsFactors = FALSE
+        )
+      }
+
+      # Recurse into replies if present
+      if (!is.null(d$replies) && is.list(d$replies)) {
+        repl_children <- d$replies$data$children
+        acc <- flatten_comments(repl_children, acc)
+      }
+    }
+  }
+  acc
+}
+
+# ---- 2) Download threads; extract ONLY keyword-matching posts + comments ----
+posts_out <- list()
+comments_out <- list()
+
+for (i in seq_len(nrow(ms_urls))) {
+  u <- ms_urls$url[i]
+  cat("Fetching", i, "of", nrow(ms_urls), "\n")
+
+  dat <- fetch_thread_json(u, tries = 3, pause = 2)
+  if (is.null(dat)) {
+    Sys.sleep(1)
+    next
+  }
+
+  # Post object
+  post <- dat[[1]]$data$children[[1]]$data
+  title <- post$title %||% ""
+  selftext <- post$selftext %||% ""
+  full_text <- paste(title, selftext, sep = " ")
+
+  # Keep ONLY keyword-matching posts
+  if (str_detect(full_text, pattern)) {
+    posts_out[[length(posts_out) + 1]] <- data.frame(
+      created_utc  = post$created_utc %||% NA,
+      author       = post$author %||% NA,
+      score        = post$score %||% NA,
+      num_comments = post$num_comments %||% NA,
+      post_id      = post$id %||% NA,
+      title        = title,
+      text         = selftext,
+      url          = u,
+      permalink    = paste0("https://www.reddit.com", post$permalink %||% ""),
+      stringsAsFactors = FALSE
+    )
+  }
+
+  # Comments
+  children <- dat[[2]]$data$children
+  flat <- flatten_comments(children, acc = list())
+  if (length(flat) > 0) {
+    cdf <- bind_rows(flat) %>% mutate(thread_url = u)
+    if (nrow(cdf) > 0) comments_out[[length(comments_out) + 1]] <- cdf
+  }
+
+  Sys.sleep(1)  # pacing (avoid triggering blocks)
+}
+
+posts_df <- if (length(posts_out) > 0) bind_rows(posts_out) else data.frame()
+comments_df <- if (length(comments_out) > 0) bind_rows(comments_out) else data.frame()
+
+cat("✅ Posts matched:", nrow(posts_df), "\n")
+cat("✅ Comments matched:", nrow(comments_df), "\n")
+
+# ---- 3) Save to Excel ----
+OUT_FILE <- file.path(getwd(), "MS_keyword_posts_comments.xlsx")
+
+wb <- createWorkbook()
+addWorksheet(wb, "Posts")
+addWorksheet(wb, "Comments")
+
+writeDataTable(wb, "Posts", posts_df)
+writeDataTable(wb, "Comments", comments_df)
+
+saveWorkbook(wb, OUT_FILE, overwrite = TRUE)
+cat("✅ Saved Excel to:", OUT_FILE, "\n")

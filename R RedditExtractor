@@ -1,11 +1,8 @@
 options(repos = c(CRAN = "https://cloud.r-project.org"))
 
-# ---- Packages ----
-pkgs <- c("RedditExtractoR", "httr", "jsonlite", "dplyr", "stringr", "openxlsx")
-for (p in pkgs) {
-  if (!requireNamespace(p, quietly = TRUE)) install.packages(p, dependencies = TRUE)
-}
-library(RedditExtractoR)
+pkgs <- c("httr", "jsonlite", "dplyr", "stringr", "openxlsx")
+for (p in pkgs) if (!requireNamespace(p, quietly = TRUE)) install.packages(p, dependencies = TRUE)
+
 library(httr)
 library(jsonlite)
 library(dplyr)
@@ -13,60 +10,135 @@ library(stringr)
 library(openxlsx)
 
 SUB <- "MultipleSclerosis"
-KEYWORDS <- c("side effect", "adverse effect", "infusion reaction",
-              "intolerance", "complication", "symptom")
-
-# Regex for matching content (handles plurals/variants)
-pattern <- regex(
-  "(side\\s*effects?|adverse\\s*effects?|infusion\\s*reactions?|intoleran(ce|t)|complications?|symptoms?)",
-  ignore_case = TRUE
-)
-
-# ---- Helper: build OR query for Reddit search ----
-build_or_query <- function(terms) {
-  terms <- trimws(terms)
-  terms <- ifelse(grepl("\\s", terms), paste0('"', terms, '"'), terms)
-  paste0("(", paste(terms, collapse = " OR "), ")")
-}
-query <- build_or_query(KEYWORDS)
-
-# ---- 1) Get thread URLs (keyword retrieval only) ----
-ms_urls <- RedditExtractoR::find_thread_urls(
-  keywords  = query,
-  subreddit = SUB,
-  sort_by   = "new",
-  period    = "all"
-) %>%
-  filter(!is.na(url), url != "") %>%
-  distinct(url, .keep_all = TRUE)
-
-cat("✅ Thread URLs found:", nrow(ms_urls), "\n")
-if (nrow(ms_urls) == 0) stop("No threads found for these keywords.")
-
-# OPTIONAL: test on a small set first (uncomment)
-# ms_urls <- ms_urls %>% slice_head(n = 20)
+OUT_FILE <- "/Users/user/MultipleSclerosis_sideeffects_posts_comments.xlsx"
+UA <- "Mozilla/5.0 (R; MS side effects keyword scrape)"
 
 `%||%` <- function(a, b) if (!is.null(a)) a else b
 
-# ---- Helper: fetch thread JSON safely ----
-fetch_thread_json <- function(thread_url, tries = 3, pause = 2) {
-  json_url <- paste0(thread_url, ".json")
-  for (i in 1:tries) {
-    resp <- tryCatch(
-      GET(json_url, add_headers(`User-Agent` = "Mozilla/5.0 (R; MS keyword corpus)")),
-      error = function(e) NULL
-    )
-    if (!is.null(resp) && status_code(resp) == 200) {
-      txt <- content(resp, as = "text", encoding = "UTF-8")
-      return(fromJSON(txt, simplifyVector = FALSE))
-    }
-    Sys.sleep(pause)
-  }
-  return(NULL)
+# -------------------------
+# Keywords (your Mayo-derived list)
+# -------------------------
+SIDE_EFFECTS <- c(
+  "insomnia",
+  "increased blood pressure", "high blood pressure", "low blood pressure",
+  "increased blood glucose", "increased blood glucose levels",
+  "mood swings", "fluid retention",
+  "flu-like symptoms",
+  "injection-site reaction", "injection-site reactions",
+  "skin irritation", "skin irritation at the injection site",
+  "swelling",
+  "liver damage", "liver inflammation", "liver irritation",
+  "hair loss",
+  "flushing",
+  "diarrhea", "nausea", "vomiting", "abdominal pain",
+  "headache", "headaches",
+  "blurred vision", "vision changes", "trouble with vision",
+  "infections", "serious infections", "viral infections",
+  "respiratory tract infections", "urinary tract infections",
+  "lowered white blood cell count", "low white blood cell count", "reduced white blood cells",
+  "changes in heart rate", "slow heart rate",
+  "changes in heart rhythm", "heart rhythm changes",
+  "infusion reaction", "infusion reactions",
+  "fever", "chills", "vertigo", "seizures",
+  "tumors",
+  "autoimmune conditions", "thyroid autoimmune disease",
+  "kidney disease", "immune-mediated kidney disease",
+  "progressive multifocal leukoencephalopathy", "pml",
+  "fetal harm", "birth defects",
+  "cancer", "breast cancer"
+)
+
+# Build case-insensitive regex; longest phrases first
+SIDE_EFFECTS <- SIDE_EFFECTS[order(nchar(SIDE_EFFECTS), decreasing = TRUE)]
+kw_regex <- regex(paste0("\\b(", paste(str_replace_all(SIDE_EFFECTS, "([\\W])", "\\\\\\1"), collapse="|"), ")\\b"),
+                  ignore_case = TRUE)
+
+# -------------------------
+# Controls for maximum coverage (tune up/down)
+# -------------------------
+LISTING_LIMIT <- 100
+MAX_PAGES_NEW <- 300
+MAX_PAGES_TOP <- 200
+TOP_PERIODS <- c("day", "week", "month", "year", "all")
+SLEEP_BETWEEN_REQUESTS <- 1.0
+SLEEP_BETWEEN_THREADS  <- 0.8
+
+# -------------------------
+# Fetch subreddit listing JSON
+# -------------------------
+fetch_listing <- function(after = NULL, sort_by = "new", period = NULL) {
+  url <- paste0("https://www.reddit.com/r/", SUB, "/", sort_by, ".json?limit=", LISTING_LIMIT)
+  if (!is.null(period) && sort_by == "top") url <- paste0(url, "&t=", period)
+  if (!is.null(after)) url <- paste0(url, "&after=", after)
+
+  resp <- GET(url, add_headers(`User-Agent` = UA))
+  if (status_code(resp) != 200) return(NULL)
+
+  txt <- content(resp, as = "text", encoding = "UTF-8")
+  fromJSON(txt, simplifyVector = FALSE)
 }
 
-# ---- Helper: flatten nested Reddit comments ----
-flatten_comments <- function(children, acc = list()) {
+# -------------------------
+# Extract posts from listing page
+# -------------------------
+extract_posts_from_listing <- function(children) {
+  out <- vector("list", length(children))
+  for (i in seq_along(children)) {
+    d <- children[[i]]$data
+    out[[i]] <- data.frame(
+      post_id      = d$id %||% NA,
+      author       = d$author %||% NA,
+      created_utc  = d$created_utc %||% NA,
+      score        = d$score %||% NA,
+      num_comments = d$num_comments %||% NA,
+      title        = d$title %||% "",
+      selftext     = d$selftext %||% "",
+      permalink    = paste0("https://www.reddit.com", d$permalink %||% ""),
+      stringsAsFactors = FALSE
+    )
+  }
+  bind_rows(out)
+}
+
+# -------------------------
+# Crawl a listing sort (new/top)
+# -------------------------
+crawl_sort <- function(sort_by = "new", period = NULL, max_pages = 50) {
+  after <- NULL
+  all_posts <- list()
+
+  for (p in 1:max_pages) {
+    cat("Listing:", sort_by, if (!is.null(period)) paste0("(t=", period, ")") else "", "page:", p, "\n")
+    dat <- fetch_listing(after = after, sort_by = sort_by, period = period)
+    if (is.null(dat)) break
+
+    children <- dat$data$children
+    if (length(children) == 0) break
+
+    all_posts[[length(all_posts) + 1L]] <- extract_posts_from_listing(children)
+
+    after <- dat$data$after
+    if (is.null(after) || after == "") break
+
+    Sys.sleep(SLEEP_BETWEEN_REQUESTS)
+  }
+
+  bind_rows(all_posts)
+}
+
+# -------------------------
+# Thread fetch + comment flatten
+# -------------------------
+fetch_thread <- function(permalink) {
+  # permalink is like "/r/.../comments/..../"
+  url <- paste0("https://www.reddit.com", permalink, ".json?limit=500")
+  resp <- GET(url, add_headers(`User-Agent` = UA))
+  if (status_code(resp) != 200) return(NULL)
+  txt <- content(resp, as = "text", encoding = "UTF-8")
+  fromJSON(txt, simplifyVector = FALSE)
+}
+
+flatten_comments <- function(children, acc = list(), post_id = NA, post_url = NA) {
   if (length(children) == 0) return(acc)
 
   for (ch in children) {
@@ -74,93 +146,116 @@ flatten_comments <- function(children, acc = list()) {
       d <- ch$data
       body <- d$body %||% ""
 
-      # Keep ONLY keyword-matching comments
-      if (str_detect(body, pattern)) {
-        acc[[length(acc) + 1]] <- data.frame(
-          created_utc = d$created_utc %||% NA,
-          author      = d$author %||% NA,
-          score       = d$score %||% NA,
-          comment_id  = d$id %||% NA,
-          parent_id   = d$parent_id %||% NA,
-          link_id     = d$link_id %||% NA,
-          body        = body,
-          permalink   = paste0("https://www.reddit.com", d$permalink %||% ""),
-          stringsAsFactors = FALSE
-        )
-      }
+      acc[[length(acc) + 1L]] <- data.frame(
+        post_id     = post_id,
+        post_url    = post_url,
+        comment_id  = d$id %||% NA,
+        link_id     = d$link_id %||% NA,
+        parent_id   = d$parent_id %||% NA,
+        author      = d$author %||% NA,
+        created_utc = d$created_utc %||% NA,
+        score       = d$score %||% NA,
+        body        = body,
+        permalink   = paste0("https://www.reddit.com", d$permalink %||% ""),
+        stringsAsFactors = FALSE
+      )
 
-      # Recurse into replies if present
       if (!is.null(d$replies) && is.list(d$replies)) {
-        repl_children <- d$replies$data$children
-        acc <- flatten_comments(repl_children, acc)
+        acc <- flatten_comments(d$replies$data$children, acc, post_id, post_url)
       }
     }
   }
   acc
 }
 
-# ---- 2) Download threads; extract ONLY keyword-matching posts + comments ----
-posts_out <- list()
-comments_out <- list()
+safe_thread <- function(u) {
+  tryCatch(fetch_thread(u), error = function(e) NULL)
+}
 
-for (i in seq_len(nrow(ms_urls))) {
-  u <- ms_urls$url[i]
-  cat("Fetching", i, "of", nrow(ms_urls), "\n")
+# -------------------------
+# 1) Collect posts (new + top periods) then dedup
+# -------------------------
+posts_new <- crawl_sort("new", max_pages = MAX_PAGES_NEW)
 
-  dat <- fetch_thread_json(u, tries = 3, pause = 2)
-  if (is.null(dat)) {
-    Sys.sleep(1)
+posts_top_list <- list()
+for (tp in TOP_PERIODS) {
+  posts_top_list[[tp]] <- crawl_sort("top", period = tp, max_pages = MAX_PAGES_TOP)
+}
+posts_top <- bind_rows(posts_top_list)
+
+posts_all <- bind_rows(posts_new, posts_top) %>%
+  filter(!is.na(post_id)) %>%
+  distinct(post_id, .keep_all = TRUE)
+
+cat("\nUnique posts collected:", nrow(posts_all), "\n")
+
+# -------------------------
+# 2) Filter POSTS by keyword (title + selftext)
+# -------------------------
+posts_all <- posts_all %>%
+  mutate(full_text = paste(title, selftext)) %>%
+  mutate(keyword_hit = str_extract_all(full_text, kw_regex)) %>%
+  mutate(keyword_hit = sapply(keyword_hit, function(x) paste(sort(unique(tolower(x))), collapse = ", ")))
+
+posts_hit <- posts_all %>%
+  filter(str_detect(full_text, kw_regex))
+
+cat("Posts matching keywords:", nrow(posts_hit), "\n")
+
+# -------------------------
+# 3) Fetch threads for matching posts and FILTER comments by keyword
+# -------------------------
+comments_acc <- list()
+
+for (i in seq_len(nrow(posts_hit))) {
+  if (i %% 25 == 0) cat("Threads processed:", i, "/", nrow(posts_hit), "\n")
+
+  post_url <- posts_hit$permalink[i]
+  permalink <- gsub("^https://www.reddit.com", "", post_url)
+
+  th <- safe_thread(permalink)
+  if (is.null(th)) {
+    Sys.sleep(SLEEP_BETWEEN_THREADS)
     next
   }
 
-  # Post object
-  post <- dat[[1]]$data$children[[1]]$data
-  title <- post$title %||% ""
-  selftext <- post$selftext %||% ""
-  full_text <- paste(title, selftext, sep = " ")
+  kids <- th[[2]]$data$children
+  flat <- flatten_comments(kids, acc = list(), post_id = posts_hit$post_id[i], post_url = post_url)
 
-  # Keep ONLY keyword-matching posts
-  if (str_detect(full_text, pattern)) {
-    posts_out[[length(posts_out) + 1]] <- data.frame(
-      created_utc  = post$created_utc %||% NA,
-      author       = post$author %||% NA,
-      score        = post$score %||% NA,
-      num_comments = post$num_comments %||% NA,
-      post_id      = post$id %||% NA,
-      title        = title,
-      text         = selftext,
-      url          = u,
-      permalink    = paste0("https://www.reddit.com", post$permalink %||% ""),
-      stringsAsFactors = FALSE
-    )
-  }
-
-  # Comments
-  children <- dat[[2]]$data$children
-  flat <- flatten_comments(children, acc = list())
   if (length(flat) > 0) {
-    cdf <- bind_rows(flat) %>% mutate(thread_url = u)
-    if (nrow(cdf) > 0) comments_out[[length(comments_out) + 1]] <- cdf
+    cm <- bind_rows(flat) %>%
+      mutate(keyword_hit = str_extract_all(body, kw_regex)) %>%
+      mutate(keyword_hit = sapply(keyword_hit, function(x) paste(sort(unique(tolower(x))), collapse = ", "))) %>%
+      filter(str_detect(body, kw_regex))
+
+    if (nrow(cm) > 0) comments_acc[[length(comments_acc) + 1L]] <- cm
   }
 
-  Sys.sleep(1)  # pacing (avoid triggering blocks)
+  Sys.sleep(SLEEP_BETWEEN_THREADS)
 }
 
-posts_df <- if (length(posts_out) > 0) bind_rows(posts_out) else data.frame()
-comments_df <- if (length(comments_out) > 0) bind_rows(comments_out) else data.frame()
+comments_hit <- bind_rows(comments_acc)
 
-cat("✅ Posts matched:", nrow(posts_df), "\n")
-cat("✅ Comments matched:", nrow(comments_df), "\n")
+cat("\nFinal keyword-matched counts:\n",
+    "Posts:", nrow(posts_hit), "\n",
+    "Comments:", nrow(comments_hit), "\n")
 
-# ---- 3) Save to Excel ----
-OUT_FILE <- file.path(getwd(), "MS_keyword_posts_comments.xlsx")
-
+# -------------------------
+# 4) Save to Excel
+# -------------------------
 wb <- createWorkbook()
 addWorksheet(wb, "Posts")
 addWorksheet(wb, "Comments")
 
-writeDataTable(wb, "Posts", posts_df)
-writeDataTable(wb, "Comments", comments_df)
+# Keep useful columns
+posts_out <- posts_hit %>%
+  select(post_id, author, created_utc, score, num_comments, title, selftext, permalink, keyword_hit)
+
+comments_out <- comments_hit %>%
+  select(post_id, post_url, comment_id, parent_id, author, created_utc, score, body, permalink, keyword_hit)
+
+writeDataTable(wb, "Posts", posts_out)
+writeDataTable(wb, "Comments", comments_out)
 
 saveWorkbook(wb, OUT_FILE, overwrite = TRUE)
-cat("✅ Saved Excel to:", OUT_FILE, "\n")
+cat("✅ Saved:", OUT_FILE, "\n")
